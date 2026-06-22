@@ -1,0 +1,54 @@
+1. Replace Chained .str.replace() with Single-Pass Processing
+Current problem: _build_sheet_scan_context flattens the entire DataFrame into a pandas Series and applies five chained .str.replace() calls followed by .str.fullmatch(RE_NUMERIC_TOKEN). Each .str call independently iterates all N elements, invokes Python's str.replace() per element, and allocates a new intermediate Series. With K chained calls, this means K×N Python function invocations plus K intermediate object-dtype array allocations.
+
+Refactor to:
+
+Combine all replacement patterns into a single compiled re.sub() pattern.
+Apply it via a list comprehension in a single pass over all cells, eliminating intermediate Series allocations.
+For numeric detection specifically, replace str.fullmatch(RE_NUMERIC_TOKEN) with try/except float() inside a list comprehension — this is 3–4× faster for numeric-heavy columns and eliminates the need for the cleaning chain entirely.
+Consider using PyArrow-backed string dtype where applicable for further string operation speedups.
+2. Remove or Replace LRU Caches
+Current problem: @lru_cache(maxsize=65536) is applied to _normalize_cell_text, _is_blank_text, and _is_numeric_like_text. On financial sheets with predominantly unique cell values (a 1000×50 sheet already exceeds 50,000 unique values), hit rates approach zero. The cache performs hash computation, dictionary lookup, eviction, and insertion on every call without ever returning a cached result. Three caches at max capacity hold approximately 30–60 MB of memory in strong references that the garbage collector cannot reclaim.
+
+Refactor to:
+
+Remove @lru_cache from _normalize_cell_text and _is_numeric_like_text entirely.
+For _is_blank_text (which has a small domain of possible inputs), replace with a simple unbounded dictionary or a hardcoded set of known blank representations.
+This recovers 30–60 MB of memory and eliminates per-call hashing overhead at zero hit rates.
+3. Implement Lazy/Two-Pass Architecture Instead of Upfront Full-Sheet Scanning
+Current problem: _build_sheet_scan_context classifies every cell in the entire sheet before any downstream logic determines which cells actually need classification. Header detection only examines the first ~20 rows, yet the scan context classifies all 1,000+ rows. Six chained string operations on 50K cells create ~25–30 MB of intermediate memory.
+
+Refactor to:
+
+Implement a two-pass architecture:
+Pass 1 (lightweight): Identify the sheet's structural layout — headers, data regions, footnotes — using fast heuristics on a limited row range.
+Pass 2 (targeted): Apply full cell classification only to the identified data region.
+Alternatively, process rows in chunks so that peak memory scales with chunk size rather than total sheet size.
+Defer computation until results are actually needed (lazy evaluation).
+4. Fix Numeric Detection Misclassification
+Current problem: The regex pipeline strips parentheses, brackets, commas, percent signs, and plus signs before applying RE_NUMERIC_TOKEN.fullmatch(). This destroys semantically meaningful information:
+
+Dates stored as serial numbers (e.g., "26/01/2008" → 38840) are accepted as plain numbers, losing date semantics.
+Alphanumeric codes like "2004E205" are misinterpreted as scientific notation.
+Accounting-format negatives like "(2.34M)" lose the negative sign when parentheses are stripped.
+Currency prefixes like "$1,200" lose semantic context.
+Refactor to:
+
+Detect parenthesized negatives before stripping brackets — flag them as negative values, not noise.
+Maintain a separate classification path for date-formatted cells (check for date patterns before numeric coercion).
+Do not treat alphanumeric codes containing "E" as scientific notation without additional validation (e.g., check if both sides of "E" are valid numeric components).
+Preserve currency and unit context as metadata rather than stripping it.
+5. Fix Header Detection Logic
+Current problem: _infer_header_rows_for_debug stops collecting header rows when numeric_hits > max(3, text_hits). This fails on financial reports where header rows contain period labels like "2022", "2023", "2024", "Q1 2025" that register as numeric hits, causing premature termination.
+
+Refactor to:
+
+Apply RE_HEADER_PERIOD_QUALIFIER as a whitelist filter during header detection — cells matching year/quarter patterns (e.g., \d{4}, Q[1-4], FY\d{4}, YTD) should be counted as text hits, not numeric hits.
+The regex RE_HEADER_PERIOD_QUALIFIER already exists in the codebase but is never used during header classification — integrate it.
+6. Handle Merged Cells Explicitly
+Current problem: When a header cell spans multiple columns, the value is stored only in the top-left cell of the merged region, leaving all other cells as NaN/empty. Blank detection then encounters unexpected nulls in header positions, causing column misalignment that propagates through all data rows.
+
+Refactor to:
+
+Before classification begins, forward-fill merged region values using the workbook's merged cell metadata (available via openpyxl's merged_cells.ranges).
+Ensure that the filled values carry a flag or metadata indicating they originated from a merge, so downstream logic can treat them as group headers rather than independent labels.
